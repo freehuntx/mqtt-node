@@ -1,5 +1,12 @@
 class_name MqttNode extends Node
 const PacketStream := preload("./packet-stream.gd")
+const Utils := preload("./utils.gd")
+
+const FREE_BROKERS =  [
+	"wss://broker.hivemq.com:8884/mqtt",
+	"wss://test.mosquitto.org:8081",
+	"wss://broker.emqx.io:8084/mqtt",
+]
 
 #region enums
 enum PacketType {
@@ -60,7 +67,7 @@ signal error(msg: String)
 #endregion
 
 #region exports
-@export var broker := "wss://broker.hivemq.com:8884/mqtt"
+@export var broker := FREE_BROKERS[0]
 @export var clean_session := true
 @export_range(0, 120) var keep_alive := 60
 @export var last_will: MqttLastWill
@@ -77,7 +84,9 @@ var last_ping_time := 0.0
 var current_ping := -1
 var subscriptions := {}
 var packet_ack_queue := {} # We put packets with their id here to have context
+var incoming_qos2_messages := {}
 var connection_state := WebSocketPeer.STATE_CLOSED
+var _last_packet_id := 0
 
 func _ready() -> void:
 	if client_id == "":
@@ -92,11 +101,13 @@ func connect_to_broker() -> Error:
 		return ERR_ALREADY_IN_USE
 
 	socket = WebSocketPeer.new()
-	socket.supported_protocols = PackedStringArray(["mqttv3.1"])
+	socket.supported_protocols = PackedStringArray(["mqtt"])
 	socket.inbound_buffer_size = 1024 * 1024
 
 	if OS.get_name() != "Web":
-		socket.handshake_headers = PackedStringArray(["User-Agent: GodotMQTT"])
+		socket.handshake_headers = PackedStringArray([
+			"User-Agent: %s" % Utils.get_user_agent()
+		])
 
 	var err := socket.connect_to_url(broker)
 	if err != OK:
@@ -216,8 +227,7 @@ func _process(_delta: float) -> void:
 			var current_time := Time.get_unix_time_from_system()
 			var time_diff := current_time - last_ping_time
 			if time_diff > keep_alive:
-				last_ping_time = current_time
-				_send_ping()
+				send_ping()
 
 # Internal functions
 func _send_packet(control_type: PacketType, control_flag: PacketFlag, payload:=PackedByteArray()) -> Error:
@@ -278,11 +288,12 @@ func _send_connect() -> Error:
 
 	return _send_packet(PacketType.CONNECT, PacketFlag.NONE, stream.data_array)
 
-func _send_ping() -> Error:
+func send_ping() -> Error:
 	if not connection_established:
 		_error("Socket not connected for ping")
 		return ERR_CONNECTION_ERROR
 
+	last_ping_time = Time.get_unix_time_from_system()
 	return _send_packet(PacketType.PINGREQ, PacketFlag.NONE)
 
 func _send_disconnect() -> Error:
@@ -318,6 +329,7 @@ func _reset() -> void:
 	packet_ack_queue = {}
 	subscriptions = {}
 	last_ping_time = 0.0
+	_last_packet_id = 0
 
 func _error(text: String) -> void:
 	error.emit(text)
@@ -325,9 +337,11 @@ func _error(text: String) -> void:
 
 func _gen_packet_id() -> int:
 	while true:
-		var id := (randi() % 65535) + 1
-		if not id in packet_ack_queue:
-			return id
+		_last_packet_id += 1
+		if _last_packet_id > 65535:
+			_last_packet_id = 1
+		if not _last_packet_id in packet_ack_queue:
+			return _last_packet_id
 	return 0
 
 # Internal callbacks
@@ -364,6 +378,9 @@ func _on_packet(type: PacketType, flags: PacketFlag, payload: PackedByteArray) -
 
 	if type == PacketType.PUBCOMP:
 		return _on_packet_pubcomp(payload)
+
+	if type == PacketType.PUBREL:
+		return _on_packet_pubrel(payload)
 
 	if type == PacketType.PINGRESP:
 		return _on_packet_pingresp(payload)
@@ -442,8 +459,8 @@ func _on_packet_publish(payload: PackedByteArray, flags: PacketFlag) -> void:
 
 	var msg = stream.get_rest_data()
 
-	message.emit(topic, msg)
 	if qos == Qos.AT_MOST_ONCE:
+		message.emit(topic, msg)
 		return
 
 	# Respond if QoS > 0
@@ -451,9 +468,11 @@ func _on_packet_publish(payload: PackedByteArray, flags: PacketFlag) -> void:
 	stream.put_u16(packet_id)
 
 	if qos == Qos.AT_LEAST_ONCE:
+		message.emit(topic, msg)
 		_send_packet(PacketType.PUBACK, PacketFlag.NONE, stream.data_array)
 	elif qos == Qos.EXACTLY_ONCE:
 		# PUBREC -> then wait PUBREL -> then PUBCOMP
+		incoming_qos2_messages[packet_id] = { topic=topic, msg=msg }
 		_send_packet(PacketType.PUBREC, PacketFlag.NONE, stream.data_array)
 
 func _on_packet_puback(payload: PackedByteArray) -> void:
@@ -484,6 +503,21 @@ func _on_packet_pubcomp(payload: PackedByteArray) -> void:
 
 	packet_ack_queue.erase(packet_id)
 	# Our publish was acknowledged
+
+func _on_packet_pubrel(payload: PackedByteArray) -> void:
+	var stream := PacketStream.new(payload)
+	var packet_id := stream.get_u16()
+	
+	# 1. Send PUBCOMP
+	_send_packet(PacketType.PUBCOMP, PacketFlag.NONE, payload)
+	
+	# 2. Deliver message
+	if packet_id in incoming_qos2_messages:
+		var item = incoming_qos2_messages[packet_id]
+		message.emit(item.topic, item.msg)
+		incoming_qos2_messages.erase(packet_id)
+	else:
+		_error("Received PUBREL for unknown packet id: %s" % packet_id)
 
 func _on_packet_pingresp(_payload) -> void:
 	current_ping = int((Time.get_unix_time_from_system() - last_ping_time) * 1000 / 2)

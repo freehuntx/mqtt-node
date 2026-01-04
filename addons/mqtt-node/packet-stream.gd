@@ -30,6 +30,10 @@ func get_dynamic_int() -> int:
 	var bit_offset := 0
 
 	while bit_offset < 7*4: # At max we read 4 bytes
+		if bytes_left == 0:
+			seek(start_position)
+			return -1
+
 		var byte := get_u8()
 		var has_more := (byte & 0x80) == 0x80
 		value |= (byte & 0x7F) << bit_offset
@@ -57,6 +61,9 @@ func get_dynamic_prefixed_data() -> Variant:
 	return get_data(data_size)[1]
 
 func get_prefixed_data() -> PackedByteArray:
+	if bytes_left < 2:
+		return PackedByteArray()
+
 	var length := get_u16()
 	if bytes_left < length:
 		push_error("PacketStream: Not enough bytes for prefixed data. Expected %d, have %d" % [length, bytes_left])
