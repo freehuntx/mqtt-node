@@ -123,6 +123,7 @@ func disconnect_from_broker() -> Error:
 		_error("No socket for disconnect")
 		return ERR_DOES_NOT_EXIST
 
+	_send_disconnect()
 	socket.close()
 	return OK
 
@@ -322,6 +323,7 @@ func _read_packet() -> Variant:
 	return { type=type, flags=flags, payload=payload }
 
 func _reset() -> void:
+	socket = null
 	connection_established = false
 	connection_state = WebSocketPeer.STATE_CLOSED
 	current_ping = -1
