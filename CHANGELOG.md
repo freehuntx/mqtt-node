@@ -1,4 +1,7 @@
-# Changelog
+# Changelog1
+
+## [0.1.1] - 2026-05-31
+- Fixed missing disconnect packet on close
 
 ## [0.1.0] - 2026-01-04
 - Fixed logo pixels issues
