@@ -1,14 +1,13 @@
 [gd_scene format=3 uid="uid://cvbdwrem30xoh"]
 
-[ext_resource type="Script" uid="uid://bdv28wwwsa2fk" path="res://root.gd" id="1_pq8q7"]
-[ext_resource type="Script" uid="uid://ebv83gyg5xdx" path="res://addons/mqtt-node/mqtt-node.gd" id="2_pyidc"]
+[ext_resource type="Script" uid="uid://deq30pia3uhir" path="res://root.gd" id="1_pq8q7"]
+[ext_resource type="Script" uid="uid://dvsdwtteqyn2i" path="res://addons/mqtt-node/mqtt-node.gd" id="2_pyidc"]
 
 [node name="root" type="Node2D" unique_id=1715642118]
 script = ExtResource("1_pq8q7")
 
 [node name="MqttNode" type="Node" parent="." unique_id=1577767151]
 script = ExtResource("2_pyidc")
-metadata/_custom_type_script = "uid://ebv83gyg5xdx"
 
 [node name="StatusLabel" type="Label" parent="." unique_id=312220321]
 offset_left = 5.0
@@ -22,10 +21,6 @@ offset_right = 121.0
 offset_bottom = 23.0
 text = "Ping: 999ms"
 
-[node name="PingTimer" type="Timer" parent="." unique_id=814821699]
-wait_time = 3.0
-autostart = true
-
 [connection signal="connected" from="MqttNode" to="." method="_on_mqtt_node_connected"]
 [connection signal="connecting" from="MqttNode" to="." method="_on_mqtt_node_connecting"]
 [connection signal="connecting_failed" from="MqttNode" to="." method="_on_mqtt_node_connecting_failed"]
@@ -33,4 +28,4 @@ autostart = true
 [connection signal="error" from="MqttNode" to="." method="_on_mqtt_node_error"]
 [connection signal="message" from="MqttNode" to="." method="_on_mqtt_node_message"]
 [connection signal="ping" from="MqttNode" to="." method="_on_mqtt_node_ping"]
-[connection signal="timeout" from="PingTimer" to="." method="_on_ping_timer_timeout"]
+[connection signal="reconnecting" from="MqttNode" to="." method="_on_mqtt_node_reconnecting"]

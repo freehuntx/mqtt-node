@@ -1,12 +1,16 @@
 extends StreamPeerBuffer
 
+## Return codes for varint decoding.
+const VARINT_INCOMPLETE := -1
+const VARINT_MALFORMED := -2
+
 var bytes_left: int:
 	get: return get_size() - get_position()
 
 var size: int:
 	get: return get_size()
 
-func _init(data:=PackedByteArray(), offset:=0) -> void:
+func _init(data := PackedByteArray(), offset := 0) -> void:
 	big_endian = true
 	data_array = data
 	seek(offset)
@@ -24,17 +28,25 @@ func remove_tail() -> void:
 func get_rest_data() -> PackedByteArray:
 	return get_data(bytes_left)[1]
 
+## Decodes a MQTT variable-length integer (Remaining Length).
+## Returns the value, or:
+##   VARINT_INCOMPLETE (-1) if the buffer does not yet hold a full varint.
+##   VARINT_MALFORMED  (-2) if the encoding is invalid (more than 4 bytes
+##   or a continuation byte after the 4th). On malformed the stream position
+##   is NOT rewound: the caller should treat the stream as desynced.
 func get_dynamic_int() -> int:
 	var start_position := get_position()
 	var value := 0
 	var bit_offset := 0
+	var byte_count := 0
 
-	while bit_offset < 7*4: # At max we read 4 bytes
+	while bit_offset < 7 * 4: # At max we read 4 bytes
 		if bytes_left == 0:
 			seek(start_position)
-			return -1
+			return VARINT_INCOMPLETE
 
 		var byte := get_u8()
+		byte_count += 1
 		var has_more := (byte & 0x80) == 0x80
 		value |= (byte & 0x7F) << bit_offset
 		bit_offset += 7
@@ -42,8 +54,10 @@ func get_dynamic_int() -> int:
 		if not has_more:
 			return value
 
-	seek(start_position)
-	return -1
+	# A 4th continuation byte would require a 5th byte, which is illegal in
+	# MQTT 3.1.1 (max 4 bytes, value <= 268435455). Leave position where it
+	# is so the caller knows the stream is poisoned.
+	return VARINT_MALFORMED
 
 func get_prefixed_int() -> int:
 	var length := get_u8()
@@ -54,9 +68,18 @@ func get_prefixed_int() -> int:
 		value = (value << 8) | data[i]
 	return value
 
+## Reads a length-prefixed (varint) chunk of bytes.
+## Returns null when incomplete (caller should wait for more data).
+## Returns VARINT_MALFORMED (-2, as int) when the varint is invalid; the
+## stream is left desynced and the caller must drop the connection.
+## Returns a PackedByteArray (possibly empty) when complete.
 func get_dynamic_prefixed_data() -> Variant:
 	var data_size := get_dynamic_int()
-	if data_size == -1 or bytes_left < data_size:
+	if data_size == VARINT_INCOMPLETE:
+		return null
+	if data_size == VARINT_MALFORMED:
+		return VARINT_MALFORMED
+	if bytes_left < data_size:
 		return null
 	return get_data(data_size)[1]
 
@@ -67,7 +90,7 @@ func get_prefixed_data() -> PackedByteArray:
 	var length := get_u16()
 	if bytes_left < length:
 		push_error("PacketStream: Not enough bytes for prefixed data. Expected %d, have %d" % [length, bytes_left])
-		return PackedByteArray() # Or return null and handle upstream
+		return PackedByteArray()
 
 	var result_arr := get_data(length)
 	var error_code = result_arr[0]
@@ -75,7 +98,7 @@ func get_prefixed_data() -> PackedByteArray:
 
 	if error_code != OK:
 		push_error("PacketStream: Error reading prefixed data. error_code=%s" % error_code)
-		return PackedByteArray() # Or return null
+		return PackedByteArray()
 
 	if data_bytes.size() != length:
 		push_error("PacketStream: Truncated read for prefixed data. Expected %d, got %d" % [length, data_bytes.size()])
