@@ -558,7 +558,8 @@ func _validate_packet_flags(ptype: int, pflags: int) -> bool:
 	match ptype:
 		PacketType.CONNECT, PacketType.CONNACK, PacketType.PUBACK, \
 		PacketType.PUBREC, PacketType.PUBCOMP, PacketType.UNSUBACK, \
-		PacketType.PINGREQ, PacketType.PINGRESP, PacketType.DISCONNECT:
+		PacketType.SUBACK, PacketType.PINGREQ, PacketType.PINGRESP, \
+		PacketType.DISCONNECT:
 			return pflags == 0
 		PacketType.PUBLISH:
 			# QoS 3 is illegal; bits 3 (DUP) allowed.
