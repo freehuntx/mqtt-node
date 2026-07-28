@@ -557,7 +557,8 @@ func _process_incoming() -> void:
 func _validate_packet_flags(ptype: int, pflags: int) -> bool:
 	match ptype:
 		PacketType.CONNECT, PacketType.CONNACK, PacketType.PUBACK, \
-		PacketType.PUBREC, PacketType.PUBCOMP, PacketType.UNSUBACK, \
+		PacketType.PUBREC, PacketType.PUBCOMP, PacketType.SUBACK, \
+		PacketType.UNSUBACK, \
 		PacketType.PINGREQ, PacketType.PINGRESP, PacketType.DISCONNECT:
 			return pflags == 0
 		PacketType.PUBLISH:

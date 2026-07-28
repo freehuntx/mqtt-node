@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-07-28
+
+### Fixed
+
+- SUBACK was missing from the fixed-header flag validation table, so every
+  incoming SUBACK was treated as a protocol error and dropped the connection,
+  preventing subscriptions from ever completing.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added
