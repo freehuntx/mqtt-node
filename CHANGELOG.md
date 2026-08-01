@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.2] - 2026-08-01
+
+### Added
+
+- `reconnect_disabled(reason: String)` signal: emitted when auto-reconnect has
+  been permanently disabled (e.g. after a non-retryable CONNACK), so consumers
+  can treat the connection as terminally closed instead of waiting for a
+  reconnect that will never come.
+- `is_idle()` public method: returns true when no socket is open and no
+  reconnect is pending, allowing embedders to safely call `connect_to_broker()`
+  or drive their own broker rotation.
+
+### Changed
+
+- Code formatting: normalized whitespace in enums and packet handler for
+  consistency.
+
 ## [0.2.1] - 2026-07-28
 
 ### Fixed

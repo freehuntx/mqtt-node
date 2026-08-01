@@ -14,46 +14,46 @@ const FREE_BROKERS = [
 
 #region enums
 enum PacketType {
-	NONE		= 0b0000,
-	CONNECT		= 0b0001,
-	CONNACK		= 0b0010,
-	PUBLISH		= 0b0011,
-	PUBACK		= 0b0100,
-	PUBREC		= 0b0101,
-	PUBREL		= 0b0110,
-	PUBCOMP		= 0b0111,
-	SUBSCRIBE	= 0b1000,
-	SUBACK		= 0b1001,
-	UNSUBSCRIBE	= 0b1010,
-	UNSUBACK	= 0b1011,
-	PINGREQ		= 0b1100,
-	PINGRESP	= 0b1101,
-	DISCONNECT	= 0b1110,
-	AUTH		= 0b1111 # MQTT 5.0 only
+	NONE = 0b0000,
+	CONNECT = 0b0001,
+	CONNACK = 0b0010,
+	PUBLISH = 0b0011,
+	PUBACK = 0b0100,
+	PUBREC = 0b0101,
+	PUBREL = 0b0110,
+	PUBCOMP = 0b0111,
+	SUBSCRIBE = 0b1000,
+	SUBACK = 0b1001,
+	UNSUBSCRIBE = 0b1010,
+	UNSUBACK = 0b1011,
+	PINGREQ = 0b1100,
+	PINGRESP = 0b1101,
+	DISCONNECT = 0b1110,
+	AUTH = 0b1111 # MQTT 5.0 only
 }
 
 enum PacketFlag {
-	NONE	= 0b0000,
-	RETAIN	= 0b0001,
-	QOS1	= 0b0010,
-	QOS2	= 0b0100,
-	DUP		= 0b1000,
+	NONE = 0b0000,
+	RETAIN = 0b0001,
+	QOS1 = 0b0010,
+	QOS2 = 0b0100,
+	DUP = 0b1000,
 }
 
 enum Qos {
-	AT_MOST_ONCE,	# QoS 0 - Best effort, no acknowledgment
-	AT_LEAST_ONCE,	# QoS 1 - Guaranteed delivery, may be duplicated
-	EXACTLY_ONCE	# QoS 2 - Guaranteed *once* delivery, no duplicates
+	AT_MOST_ONCE, # QoS 0 - Best effort, no acknowledgment
+	AT_LEAST_ONCE, # QoS 1 - Guaranteed delivery, may be duplicated
+	EXACTLY_ONCE # QoS 2 - Guaranteed *once* delivery, no duplicates
 }
 
 enum ConnectFlags {
-	CLEAN_SESSION		= 0x02,
-	LAST_WILL			= 0x04,
-	LAST_WILL_QOS_1		= 0x08,
-	LAST_WILL_QOS_2		= 0x10,
-	LAST_WILL_RETAIN	= 0x20,
-	PASS				= 0x40,
-	USER				= 0x80
+	CLEAN_SESSION = 0x02,
+	LAST_WILL = 0x04,
+	LAST_WILL_QOS_1 = 0x08,
+	LAST_WILL_QOS_2 = 0x10,
+	LAST_WILL_RETAIN = 0x20,
+	PASS = 0x40,
+	USER = 0x80
 }
 
 ## Internal connection state machine.
@@ -95,6 +95,12 @@ signal message(topic: String, payload: PackedByteArray, retained: bool)
 signal ping(ms: int)
 ## Generic error channel (bad packets, CONNACK codes, publish failures...).
 signal error(message: String)
+## Emitted once when auto-reconnect has been permanently disabled (e.g. after
+## a non-retryable CONNACK code, or when auto_reconnect is off), so consumers
+## can treat the connection as terminally closed rather than waiting for a
+## reconnect that will never come. Fires from the socket-close handler after
+## the final `connecting_failed`/`disconnected` of the failed attempt.
+signal reconnect_disabled(reason: String)
 #endregion
 
 #region exports
@@ -260,6 +266,12 @@ func disconnect_from_broker() -> Error:
 		_connection_state = State.IDLE
 		disconnected.emit("client disconnect")
 	return OK
+
+## True when no socket is open and no reconnect is pending, i.e. when
+## connect_to_broker() may be called. Public accessor so embedders can drive
+## their own broker rotation without reaching into `_connection_state`.
+func is_idle() -> bool:
+	return _connection_state == State.IDLE
 
 func _process(_delta: float) -> void:
 	# Handle scheduled reconnects.
@@ -575,15 +587,15 @@ func _on_packet(ptype: int, pflags: int, payload: PackedByteArray) -> void:
 	# Any received control packet proves the connection is alive.
 	last_packet_received_time = Time.get_unix_time_from_system()
 	match ptype:
-		PacketType.CONNACK:     _on_packet_connack(payload)
-		PacketType.SUBACK:      _on_packet_suback(payload)
-		PacketType.UNSUBACK:    _on_packet_unsuback(payload)
-		PacketType.PUBLISH:     _on_packet_publish(payload, pflags)
-		PacketType.PUBACK:      _on_packet_puback(payload)
-		PacketType.PUBREC:      _on_packet_pubrec(payload)
-		PacketType.PUBCOMP:     _on_packet_pubcomp(payload)
-		PacketType.PUBREL:      _on_packet_pubrel(payload)
-		PacketType.PINGRESP:    _on_packet_pingresp(payload)
+		PacketType.CONNACK: _on_packet_connack(payload)
+		PacketType.SUBACK: _on_packet_suback(payload)
+		PacketType.UNSUBACK: _on_packet_unsuback(payload)
+		PacketType.PUBLISH: _on_packet_publish(payload, pflags)
+		PacketType.PUBACK: _on_packet_puback(payload)
+		PacketType.PUBREC: _on_packet_pubrec(payload)
+		PacketType.PUBCOMP: _on_packet_pubcomp(payload)
+		PacketType.PUBREL: _on_packet_pubrel(payload)
+		PacketType.PINGRESP: _on_packet_pingresp(payload)
 		PacketType.DISCONNECT:
 			# Server-initiated disconnect: close transport, allow reconnect.
 			_fail_connection("server DISCONNECT")
@@ -807,6 +819,7 @@ func _on_socket_closed() -> void:
 		_schedule_reconnect()
 	else:
 		_connection_state = State.IDLE
+		reconnect_disabled.emit(reason if not reason.is_empty() else "reconnect disabled")
 
 func _schedule_reconnect() -> void:
 	# Reset the attempt counter only if the just-ended session survived
