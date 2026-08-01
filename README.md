@@ -64,6 +64,7 @@ packet is built, so you can pre-sign a fresh will between reconnects.
 | `reconnecting(attempt: int, delay: float)` | Before each reconnect attempt, after the backoff delay is scheduled. |
 | `connecting()` | Socket opening for the first time. |
 | `connecting_failed()` | Initial (non-reconnect) connection attempt failed. |
+| `reconnect_disabled(reason: String)` | Emitted when auto-reconnect is permanently disabled (e.g. after a non-retryable CONNACK), so consumers know not to wait for a reconnect. |
 | `subscribed(topic: String, qos: int)` | On SUBACK, per filter. |
 | `unsubscribed(topic: String)` | On UNSUBACK, per filter. |
 | `message(topic: String, payload: PackedByteArray, retained: bool)` | Incoming PUBLISH. `retained` mirrors the RETAIN bit of the received packet. |
@@ -74,6 +75,7 @@ packet is built, so you can pre-sign a fresh will between reconnects.
 ```gdscript
 func connect_to_broker() -> Error
 func disconnect_from_broker() -> Error
+func is_idle() -> bool  # True when no socket is open and no reconnect is pending; safe to call connect_to_broker().
 func publish(topic: String, payload, retain: bool = false, qos: int = 0) -> bool
 func subscribe(topic: String, qos: int = 0) -> Error
 func unsubscribe(topic: String) -> Error
