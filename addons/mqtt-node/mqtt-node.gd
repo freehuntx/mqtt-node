@@ -151,6 +151,16 @@ var will_payload: PackedByteArray = PackedByteArray()
 ## When > 0, publishes are buffered and flushed after reconnect, dropping
 ## the oldest on overflow.
 @export var offline_queue_size: int = 0
+## Socket capacity and bounded connected-state queue for reliable/control packets.
+## QoS 0 publishes are rejected during congestion rather than buffering stale updates.
+@export var outbound_buffer_size: int = 1024 * 1024
+@export var outbound_queue_bytes: int = 1024 * 1024
+## QoS 0 publishes may wait in that queue too, but only while it holds less
+## than this: a short backlog (in the browser, everything sent within one
+## frame) is fine, a congested link drops transient updates instead of
+## delivering them late.
+@export var transient_queue_bytes: int = 64 * 1024
+const MAX_OUTBOUND_QUEUED_PACKETS := 4096
 #endregion
 #endregion
 
@@ -197,6 +207,15 @@ var packet_ack_queue := {}
 var incoming_qos2_messages := {}
 # Offline queue (bounded). Each entry: { topic, payload, retain, qos }
 var _offline_queue := []
+var _outgoing: Array[PackedByteArray] = []
+var _unacknowledged: Array = []
+## Why the last publish() returned false: ERR_BUSY (congested, or no free
+## packet id - retry later), ERR_CONNECTION_ERROR (not connected),
+## ERR_INVALID_DATA (too large for the socket), ERR_INVALID_PARAMETER.
+var last_publish_error: Error = OK
+var _outgoing_bytes := 0
+var _disconnect_deadline := 0
+var _disconnect_packet_pending := false
 #endregion
 
 func _ready() -> void:
@@ -223,6 +242,7 @@ func connect_to_broker() -> Error:
 	socket = WebSocketPeer.new()
 	socket.supported_protocols = PackedStringArray(["mqtt"])
 	socket.inbound_buffer_size = max(1024 * 1024, max_packet_size * 2)
+	socket.outbound_buffer_size = maxi(1024, outbound_buffer_size)
 
 	if OS.get_name() != "Web":
 		socket.handshake_headers = PackedStringArray([
@@ -240,7 +260,7 @@ func connect_to_broker() -> Error:
 		return err
 
 	_connection_state = State.CONNECTING
-	last_packet_sent_time = Time.get_unix_time_from_system()
+	last_packet_sent_time = _now_s()
 	connecting.emit()
 	return OK
 
@@ -250,14 +270,29 @@ func connect_to_broker() -> Error:
 ## transport-close transition in `_process` does the final cleanup and emits
 ## `disconnected`. Nulling the socket here would drop the send buffer and the
 ## broker would treat the disconnect as ungraceful (firing the Last Will).
-func disconnect_from_broker() -> Error:
+##
+## `flush_timeout_ms` > 0 additionally blocks (up to that long) until the
+## close handshake has completed. Use it when the node is about to be freed
+## or the game is quitting: tearing the socket down right after writing
+## makes the broker see an abrupt drop (and publish the Last Will) even
+## though DISCONNECT was sent. Has no effect on the Web, where the browser
+## owns the socket and blocking would only freeze the page.
+func disconnect_from_broker(flush_timeout_ms: int = 0) -> Error:
 	# Mark the intent so the CLOSE transition goes through the DISCONNECTING
 	# branch (no auto-reconnect, emits "client disconnect").
 	_connection_state = State.DISCONNECTING
+	_disconnect_deadline = Time.get_ticks_msec() + 2000
 	if socket:
-		if connection_established:
-			_send_disconnect()
-		socket.close()
+		_disconnect_packet_pending = connection_established and _send_disconnect() != OK
+		_drive_disconnect()
+		socket.poll()
+		if flush_timeout_ms > 0 and not OS.has_feature("web"):
+			var deadline := Time.get_ticks_msec() + flush_timeout_ms
+			while socket.get_ready_state() != WebSocketPeer.STATE_CLOSED and Time.get_ticks_msec() < deadline:
+				OS.delay_msec(1)
+				socket.poll()
+				if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
+					_drive_disconnect()
 		# Do NOT null the socket: _process keeps polling it until CLOSED,
 		# which drives _on_socket_closed -> the DISCONNECTING branch.
 	else:
@@ -266,6 +301,15 @@ func disconnect_from_broker() -> Error:
 		_connection_state = State.IDLE
 		disconnected.emit("client disconnect")
 	return OK
+
+## One step of a graceful disconnect: get queued packets and the DISCONNECT
+## out, then start the WebSocket close handshake (or give up at the deadline).
+func _drive_disconnect() -> void:
+	_flush_outgoing()
+	if _disconnect_packet_pending:
+		_disconnect_packet_pending = _send_disconnect() != OK
+	if (not _disconnect_packet_pending and _outgoing.is_empty() and socket.get_current_outbound_buffered_amount() == 0) or Time.get_ticks_msec() >= _disconnect_deadline:
+		socket.close()
 
 ## True when no socket is open and no reconnect is pending, i.e. when
 ## connect_to_broker() may be called. Public accessor so embedders can drive
@@ -276,7 +320,7 @@ func is_idle() -> bool:
 func _process(_delta: float) -> void:
 	# Handle scheduled reconnects.
 	if _connection_state == State.RECONNECT_WAIT:
-		if Time.get_unix_time_from_system() >= _reconnect_at:
+		if _now_s() >= _reconnect_at:
 			_do_reconnect()
 		return
 
@@ -285,6 +329,11 @@ func _process(_delta: float) -> void:
 
 	socket.poll()
 	var ready_state := socket.get_ready_state()
+	# Buffer whatever arrived, in every state: data that comes in together
+	# with a close (a CONNACK refusal, say) is otherwise lost once the socket
+	# has moved on to CLOSING/CLOSED. Parsing still happens below.
+	while socket.get_available_packet_count():
+		recv_stream.append_data(socket.get_packet())
 
 	# Detect transport-level open -> we send CONNECT once.
 	if ready_state == WebSocketPeer.STATE_OPEN and not connection_established and not _connect_sent:
@@ -293,10 +342,26 @@ func _process(_delta: float) -> void:
 
 	# Detect transport close.
 	if ready_state == WebSocketPeer.STATE_CLOSED:
+		# Read what arrived before the close first: a broker refusing us sends
+		# CONNACK with the reason and hangs up right away. Without this the
+		# refusal is never seen and we would keep retrying forever.
+		if _connection_state != State.DISCONNECTING:
+			_process_incoming()
 		_on_socket_closed()
 		return
 
 	if ready_state != WebSocketPeer.STATE_OPEN:
+		return
+	_flush_outgoing()
+	if _connection_state == State.DISCONNECTING:
+		_drive_disconnect()
+		return # Only poll the close handshake; no CONNECT/CONNACK work after cancellation.
+
+	# Parse buffered replies (read above) before evaluating deadlines.
+	# Backgrounded windows can resume after the timeout with a valid CONNACK
+	# already waiting in the socket.
+	_process_incoming()
+	if socket == null or _connection_state == State.DISCONNECTING or not _pending_fail_reason.is_empty():
 		return
 
 	# CONNACK timeout: the WebSocket handshake completed but the broker never
@@ -305,15 +370,9 @@ func _process(_delta: float) -> void:
 	# would leave us in CONNECTING forever (keepalive doesn't run yet because
 	# connection_established is false).
 	if _connect_sent and not connection_established:
-		if Time.get_unix_time_from_system() - _connect_sent_at > 10.0:
-			_fail_connection("CONNACK timeout (no broker response)")
-
-	# Drain the WebSocket receive buffer into our byte stream.
-	while socket.get_available_packet_count():
-		recv_stream.append_data(socket.get_packet())
-
-	# Parse as many complete MQTT packets as available.
-	_process_incoming()
+		if _now_s() - _connect_sent_at > 10.0:
+			_fail_connection("CONNACK timeout (no broker response)", true)
+			return
 
 	# Keep-alive / half-open detection.
 	if connection_established:
@@ -327,7 +386,10 @@ func _process(_delta: float) -> void:
 ## only guaranteed-supported level in this release; passing an unsupported
 ## QoS pushes an error and returns false rather than silently downgrading.
 ## Returns false when not connected (unless an offline queue is configured).
+## When connected, true means accepted for sending. Returns false for oversized
+## packets or a full outbound queue; QoS 0 is never queued during congestion.
 func publish(topic: String, payload, retain: bool = false, qos: int = 0) -> bool:
+	last_publish_error = OK
 	var bytes: PackedByteArray
 	if payload is PackedByteArray:
 		bytes = payload
@@ -336,10 +398,12 @@ func publish(topic: String, payload, retain: bool = false, qos: int = 0) -> bool
 	elif payload == null:
 		bytes = PackedByteArray()
 	else:
+		last_publish_error = ERR_INVALID_PARAMETER
 		_error("publish: payload must be PackedByteArray or String")
 		return false
 
 	if qos != 0 and qos != 1 and qos != 2:
+		last_publish_error = ERR_INVALID_PARAMETER
 		_error("publish: unsupported qos %d (only 0, 1, 2 allowed)" % qos)
 		return false
 
@@ -347,6 +411,7 @@ func publish(topic: String, payload, retain: bool = false, qos: int = 0) -> bool
 		if offline_queue_size > 0:
 			_enqueue_offline(topic, bytes, retain, qos)
 			return true
+		last_publish_error = ERR_CONNECTION_ERROR
 		_error("publish: not connected")
 		return false
 
@@ -445,20 +510,33 @@ func _send_publish(topic: String, payload: PackedByteArray, retain: bool, qos: i
 	var packet_id := 0
 	if qos > 0:
 		packet_id = _gen_packet_id()
+		if packet_id == 0:
+			last_publish_error = ERR_BUSY
+			_error("publish: no free packet id (65535 QoS>0 publishes unacknowledged)")
+			return false
 		packet_ack_queue[packet_id] = {
 			"type" = PacketType.PUBLISH,
 			"qos" = qos,
 			"topic" = topic,
 			"payload" = payload,
-			"sent_at" = Time.get_unix_time_from_system(),
+			"retain" = retain,
+			"sent_at" = _now_s(),
 		}
 	var pkt := build_publish(topic, payload, retain, qos, packet_id)
-	return _send_raw(pkt) == OK
+	var err := _send_raw(pkt, qos > 0)
+	if err == OK:
+		return true
+	last_publish_error = err
+	if packet_id > 0:
+		packet_ack_queue.erase(packet_id)
+	return false
 
 func _send_subscribe(topics: Array, qos_override := -1) -> Error:
 	if topics.is_empty():
 		return OK
 	var packet_id := _gen_packet_id()
+	if packet_id == 0:
+		return ERR_BUSY
 	# Record the filters for SUBACK-driven subscribed() signals + registry.
 	_pending_ops[packet_id] = {"op": "sub", "topics": topics.duplicate()}
 
@@ -474,6 +552,8 @@ func _send_unsubscribe(topics: Array) -> Error:
 	if topics.is_empty():
 		return OK
 	var packet_id := _gen_packet_id()
+	if packet_id == 0:
+		return ERR_BUSY
 	_pending_ops[packet_id] = {"op": "unsub", "topics": topics.duplicate()}
 
 	var stream := PacketStream.new()
@@ -485,7 +565,7 @@ func _send_unsubscribe(topics: Array) -> Error:
 func send_ping() -> Error:
 	if not _is_connected():
 		return ERR_CONNECTION_ERROR
-	last_ping_time = Time.get_unix_time_from_system()
+	last_ping_time = _now_s()
 	return _send_packet(PacketType.PINGREQ, PacketFlag.NONE)
 
 func _send_disconnect() -> Error:
@@ -499,18 +579,56 @@ func _send_packet(control_type: int, control_flag: int, payload := PackedByteArr
 	stream.put_dynamic_prefixed_data(payload)
 	return _send_raw(stream.data_array)
 
-## Sends an already-assembled full packet (fixed header + remaining length +
-## body) over the socket and updates the keep-alive timer.
-func _send_raw(data: PackedByteArray) -> Error:
+## OK means accepted by the socket or bounded local queue. Never call the
+## native send when congested: it logs ERR_OUT_OF_MEMORY before returning.
+func _send_raw(data: PackedByteArray, queue_if_busy := true) -> Error:
 	if socket == null or socket.get_ready_state() != WebSocketPeer.STATE_OPEN:
 		return ERR_CONNECTION_ERROR
-	var ok := socket.send(data) == OK
-	if ok:
-		last_packet_sent_time = Time.get_unix_time_from_system()
-	return OK if ok else FAILED
+	if data.size() > socket.outbound_buffer_size - 14:
+		return ERR_INVALID_DATA
+	if _outgoing.is_empty() and _socket_can_send():
+		var err := socket.send(data)
+		if err == OK:
+			last_packet_sent_time = _now_s()
+		return err
+	if _outgoing.size() >= MAX_OUTBOUND_QUEUED_PACKETS or _outgoing_bytes + data.size() > outbound_queue_bytes:
+		return ERR_BUSY
+	if not queue_if_busy and _outgoing_bytes + data.size() > transient_queue_bytes:
+		return ERR_BUSY
+	_outgoing.append(data)
+	_outgoing_bytes += data.size()
+	return OK
 
+func _socket_can_send() -> bool:
+	# Waiting for the previous send to drain also avoids the native queued-message
+	# count limit, whose current usage is not exposed by WebSocketPeer.
+	return socket.get_current_outbound_buffered_amount() == 0
+
+func _flush_outgoing() -> void:
+	while not _outgoing.is_empty() and _socket_can_send():
+		# Browser bufferedAmount stays nonzero until the JS event loop runs.
+		# Sending one MQTT packet per WebSocket frame therefore capped the queue
+		# at one packet per Godot frame, starving PUBACK/game ACKs and checkpoints.
+		# MQTT is a byte stream: batch complete packets without changing order.
+		var batch := PackedByteArray()
+		var count := 0
+		var budget := mini(65536, socket.outbound_buffer_size - 14)
+		for data in _outgoing:
+			if count > 0 and batch.size() + data.size() > budget:
+				break
+			batch.append_array(data)
+			count += 1
+		if socket.send(batch) != OK:
+			return
+		for index in range(count):
+			_outgoing.pop_front()
+		_outgoing_bytes -= batch.size()
+		last_packet_sent_time = _now_s()
+
+## Next free packet id, or 0 when all 65535 are in flight (the broker stopped
+## acknowledging) - callers must then fail instead of reusing an id.
 func _gen_packet_id() -> int:
-	while true:
+	for _i in 65535:
 		_last_packet_id += 1
 		if _last_packet_id > 65535:
 			_last_packet_id = 1
@@ -526,10 +644,9 @@ func _gen_packet_id() -> int:
 func _process_incoming() -> void:
 	while true:
 		var start_pos := recv_stream.get_position()
-		var control_byte := recv_stream.get_u8()
-		if recv_stream.get_position() == start_pos:
-			# no byte available
+		if recv_stream.bytes_left == 0:
 			break
+		var control_byte := recv_stream.get_u8()
 
 		var ptype := control_byte >> 4
 		var pflags := control_byte & 0xF
@@ -562,7 +679,10 @@ func _process_incoming() -> void:
 		if not _pending_fail_reason.is_empty():
 			return
 
-		# Drop consumed bytes from the head of the buffer.
+	# Drop consumed bytes from the head of the buffer - once per batch, not
+	# per packet: trimming copies everything that is still buffered, so doing
+	# it for every packet is quadratic in the size of a burst.
+	if recv_stream.get_position() > 0:
 		recv_stream.remove_tail()
 
 ## Validates fixed-header flags for each packet type per MQTT 3.1.1 table.
@@ -585,7 +705,7 @@ func _validate_packet_flags(ptype: int, pflags: int) -> bool:
 
 func _on_packet(ptype: int, pflags: int, payload: PackedByteArray) -> void:
 	# Any received control packet proves the connection is alive.
-	last_packet_received_time = Time.get_unix_time_from_system()
+	last_packet_received_time = _now_s()
 	match ptype:
 		PacketType.CONNACK: _on_packet_connack(payload)
 		PacketType.SUBACK: _on_packet_suback(payload)
@@ -620,7 +740,7 @@ func _on_packet_connack(payload: PackedByteArray) -> void:
 
 	# Successful connect. Mark alive timers.
 	connection_established = true
-	_connected_at = Time.get_unix_time_from_system()
+	_connected_at = _now_s()
 	last_packet_received_time = _connected_at
 	last_packet_sent_time = _connected_at
 
@@ -675,7 +795,10 @@ func _on_packet_unsuback(payload: PackedByteArray) -> void:
 	if op.get("op", "") != "unsub":
 		return
 	for topic in op["topics"]:
-		subscriptions.erase(topic)
+		# The registry entry was already removed in unsubscribe(). Do not
+		# erase again here: the filter may have been subscribed anew while
+		# this UNSUBACK was in flight, and erasing would silently drop it
+		# from the set that is restored after a reconnect.
 		unsubscribed.emit(topic)
 
 func _on_packet_publish(payload: PackedByteArray, pflags: int) -> void:
@@ -758,7 +881,7 @@ func _on_packet_pubrel(payload: PackedByteArray) -> void:
 		_error("PUBREL for unknown packet id %d" % packet_id)
 
 func _on_packet_pingresp(_payload: PackedByteArray) -> void:
-	current_ping = int((Time.get_unix_time_from_system() - last_ping_time) * 1000)
+	current_ping = int((_now_s() - last_ping_time) * 1000)
 	ping.emit(current_ping)
 #endregion
 
@@ -766,10 +889,15 @@ func _on_packet_pingresp(_payload: PackedByteArray) -> void:
 func _handle_keepalive() -> void:
 	if keep_alive <= 0:
 		return
-	var now := Time.get_unix_time_from_system()
+	var now := _now_s()
 
-	# Send PINGREQ when no control packet has been sent for keep_alive seconds.
+	# Send PINGREQ when no control packet has been sent for keep_alive seconds
+	# (what the broker requires) - and also when nothing has been RECEIVED for
+	# that long: a client that only publishes never hears from the broker, and
+	# without a ping the half-open check below would kill a healthy link.
 	if now - last_packet_sent_time >= keep_alive:
+		send_ping()
+	elif now - last_packet_received_time >= keep_alive and now - last_ping_time >= keep_alive * 0.25:
 		send_ping()
 
 	# Half-open detection: if no packet (PINGRESP or anything else) has been
@@ -786,19 +914,20 @@ func _handle_keepalive() -> void:
 func _on_socket_open() -> void:
 	# Transport is open; send the MQTT CONNECT exactly once.
 	_connect_sent = true
-	_connect_sent_at = Time.get_unix_time_from_system()
+	_connect_sent_at = _now_s()
 	_send_connect()
 
 func _on_socket_closed() -> void:
 	var was_established := connection_established
+	var was_disconnecting := _connection_state == State.DISCONNECTING
 	var reason := _pending_fail_reason
 	_pending_fail_reason = ""
 	# Snapshot how long the session survived before _reset_session wipes it.
 	# Used by _schedule_reconnect to reset the backoff attempt counter.
 	if _connected_at > 0:
-		_last_session_survived = Time.get_unix_time_from_system() - _connected_at
+		_last_session_survived = _now_s() - _connected_at
 	_reset_session()
-	if _connection_state == State.DISCONNECTING:
+	if was_disconnecting:
 		# Intentional graceful disconnect: finalize, do not reconnect.
 		_connection_state = State.IDLE
 		disconnected.emit("client disconnect")
@@ -833,7 +962,7 @@ func _schedule_reconnect() -> void:
 	var upper := min(cap, base)
 	# Full jitter.
 	var delay := randf_range(0.0, upper)
-	_reconnect_at = Time.get_unix_time_from_system() + delay
+	_reconnect_at = _now_s() + delay
 	_connection_state = State.RECONNECT_WAIT
 	reconnecting.emit(_reconnect_attempt, delay)
 
@@ -841,12 +970,16 @@ func _do_reconnect() -> void:
 	_connection_state = State.IDLE
 	connect_to_broker()
 
-func _fail_connection(reason: String) -> void:
-	if not _pending_fail_reason.is_empty():
+func _fail_connection(reason: String, recoverable := false) -> void:
+	if _connection_state == State.DISCONNECTING or not _pending_fail_reason.is_empty():
 		return # already failing; avoid re-entrancy
-	_error(reason)
+	if recoverable:
+		error.emit(reason) # Retry/UI status, not a script/programming error.
+		print_verbose("[mqtt-node] " + reason)
+	else:
+		_error(reason)
 	if _connected_at > 0:
-		_last_session_survived = Time.get_unix_time_from_system() - _connected_at
+		_last_session_survived = _now_s() - _connected_at
 	_pending_fail_reason = reason
 	# NOTE: do not clear connection_established here; _on_socket_closed needs
 	# to snapshot it (was_established) to pick the right signal. _reset_session
@@ -858,8 +991,28 @@ func _fail_connection(reason: String) -> void:
 #endregion
 
 #region session reset
+## QoS>0 publishes the broker had not acknowledged when the connection died
+## (queued in the socket or in flight), oldest first, each as
+## {topic, payload, qos, retain}. Clears the list. With Clean Session nothing
+## is resent automatically; the caller may publish them again.
+func take_unacknowledged() -> Array:
+	var out := _unacknowledged
+	_unacknowledged = []
+	return out
+
 func _reset_session() -> void:
+	# Only the connection that just died; older lists were either taken or
+	# are stale by now.
+	_unacknowledged = []
+	for id in packet_ack_queue:
+		var e: Dictionary = packet_ack_queue[id]
+		if e.get("type") == PacketType.PUBLISH:
+			_unacknowledged.append({"topic": e.topic, "payload": e.payload, "qos": e.qos, "retain": e.get("retain", false)})
 	socket = null
+	_outgoing.clear()
+	_outgoing_bytes = 0
+	_disconnect_deadline = 0
+	_disconnect_packet_pending = false
 	connection_established = false
 	_connect_sent = false
 	_connect_sent_at = 0.0
@@ -895,8 +1048,14 @@ func _flush_offline_queue() -> void:
 #endregion
 
 #region helpers
+## Seconds on the monotonic clock. Keepalive, timeouts and reconnect backoff
+## measure intervals; the wall clock can be stepped (NTP, user) and would fake
+## a keepalive timeout or stop pinging altogether.
+static func _now_s() -> float:
+	return Time.get_ticks_usec() / 1_000_000.0
+
 func _is_connected() -> bool:
-	return connection_established and socket != null and socket.get_ready_state() == WebSocketPeer.STATE_OPEN
+	return connection_established and _connection_state != State.DISCONNECTING and socket != null and socket.get_ready_state() == WebSocketPeer.STATE_OPEN
 
 func _error(text: String) -> void:
 	error.emit(text)

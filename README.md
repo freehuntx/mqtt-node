@@ -55,6 +55,9 @@ packet is built, so you can pre-sign a fresh will between reconnects.
 |----------|------|---------|-------------|
 | `max_packet_size` | `int` | `262144` | Packets whose Remaining Length exceeds this are a protocol error → disconnect. |
 | `offline_queue_size` | `int` | `0` | Bounded outgoing queue while disconnected. 0 = fail-fast (default). Flushes after reconnect, dropping the oldest on overflow. |
+| `outbound_buffer_size` | `int` | `1048576` | WebSocket send buffer. A single packet larger than this is refused (`ERR_INVALID_DATA`). |
+| `outbound_queue_bytes` | `int` | `1048576` | While connected, packets the socket cannot take yet wait in a bounded queue (max 4096 packets). When full, `publish` returns `false` with `ERR_BUSY`. |
+| `transient_queue_bytes` | `int` | `65536` | QoS 0 publishes only wait in that queue while it holds less than this: a short backlog (in the browser everything sent within one frame) is fine, a congested link drops transient updates instead of delivering them late. |
 
 ## Signals
 | Signal | Description |
@@ -74,19 +77,26 @@ packet is built, so you can pre-sign a fresh will between reconnects.
 ## Methods
 ```gdscript
 func connect_to_broker() -> Error
-func disconnect_from_broker() -> Error
+func disconnect_from_broker(flush_timeout_ms: int = 0) -> Error  # > 0: block until the close handshake completed (before freeing / quitting; no effect on Web)
 func is_idle() -> bool  # True when no socket is open and no reconnect is pending; safe to call connect_to_broker().
 func publish(topic: String, payload, retain: bool = false, qos: int = 0) -> bool
 func subscribe(topic: String, qos: int = 0) -> Error
 func unsubscribe(topic: String) -> Error
 func send_ping() -> Error  # normally automatic via keep_alive
+func take_unacknowledged() -> Array  # QoS>0 publishes a dead connection never got acknowledged
+var last_publish_error: Error  # why the last publish() returned false
 ```
 - `publish` accepts `PackedByteArray` (raw bytes) or `String` (UTF-8). Returns
-  `false` when not connected unless `offline_queue_size > 0`. QoS 1/2 are
-  supported on the **receive** side (PUBACK/PUBREC/PUBREL/PUBCOMP handshake
-  handled); on the **send** side QoS 1 publishes are tracked for PUBACK but
-  **not** retransmitted on timeout, and pending entries are cleared on
-  reconnect — so send-side is "fire and track", not strict at-least-once.
+  `false` when not connected unless `offline_queue_size > 0`;
+  `last_publish_error` then says why: `ERR_BUSY` (congested, or no free
+  packet id - retry later), `ERR_CONNECTION_ERROR` (not connected),
+  `ERR_INVALID_DATA` (too large for the socket), `ERR_INVALID_PARAMETER`.
+  QoS 1/2 are supported on the **receive** side (PUBACK/PUBREC/PUBREL/PUBCOMP
+  handshake handled); on the **send** side QoS 1 publishes are tracked for
+  PUBACK but **not** retransmitted on timeout. With Clean Session nothing is
+  resent after a reconnect either: `take_unacknowledged()` hands back the
+  publishes (`{topic, payload, qos, retain}`, oldest first) the dead
+  connection never got acknowledged, so the caller can publish them again.
   An unsupported QoS value fails loudly and returns `false`.
 - `subscribe`/`unsubscribe` update a registry that is replayed after every
   reconnect, so subscriptions survive drops without user code.

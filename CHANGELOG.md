@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.3.0]
+
+### Added
+
+- `take_unacknowledged()`: QoS>0 publishes the broker had not acknowledged when
+  the connection died, so the caller can publish them again after a reconnect
+  (Clean Session resends nothing).
+- `last_publish_error`: why the last `publish()` returned `false` (`ERR_BUSY`,
+  `ERR_CONNECTION_ERROR`, `ERR_INVALID_DATA`, `ERR_INVALID_PARAMETER`).
+- `disconnect_from_broker(flush_timeout_ms)`: optionally blocks until the close
+  handshake completed, for use right before freeing the node or quitting
+  (otherwise the broker sees an abrupt drop and publishes the Last Will).
+- Bounded outgoing queue while connected (`outbound_buffer_size`,
+  `outbound_queue_bytes`, `transient_queue_bytes`): packets the socket cannot
+  take yet wait instead of failing; QoS 0 waits only up to 64 KiB.
+
+### Fixed
+
+- A burst of incoming packets was parsed in quadratic time (receive buffer
+  trimmed per packet).
+- A client that kept publishing but received nothing never sent PINGREQ, so its
+  own dead-link check dropped a healthy connection after 1.5 × `keep_alive`. It
+  now pings when nothing was received, too.
+- QoS 0 publishes were dropped whenever the socket was still sending - in the
+  browser every publish after the first one in a frame.
+- A CONNACK refusal that arrived together with the close was never seen.
+- Running out of packet ids looped forever; `publish()` now fails with
+  `ERR_BUSY`.
+- A late UNSUBACK dropped a filter that had been subscribed again from the
+  re-subscribe registry.
+- Keepalive, CONNACK timeout and reconnect backoff used the wall clock and broke
+  when the system time changed; they use a monotonic clock now.
+
 ## [0.2.2] - 2026-08-01
 
 ### Added
