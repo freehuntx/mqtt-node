@@ -1,6 +1,7 @@
-# mqtt-node
+# MQTT Node
 
 ## Overview
+
 A robust MQTT **3.1.1** client for Godot 4, written in pure GDScript and using
 **WebSocket transport only** (`ws`/`wss`). There are no plans to support raw
 TCP/UDP — WebSocket keeps it web-export friendly.
@@ -9,10 +10,11 @@ The addon exposes an `MqttNode` node that is fully usable from the inspector:
 exported properties for broker, credentials, keep-alive, last will, and
 auto-reconnect, plus signals for every lifecycle event. Binary payloads are
 supported end-to-end (no UTF-8 round-tripping), the RETAIN flag is readable on
-received messages, and dropped connections recover automatically with
-backoff and re-subscription.
+received messages, and dropped connections recover automatically with backoff
+and re-subscription.
 
 ## Installation
+
 1. Copy `addons/mqtt-node` into your Godot project's `addons/` folder.
 2. Enable the addon (or just preload the script — it has no editor plugin).
 3. Add an `MqttNode` node, or instantiate it from code.
@@ -20,61 +22,67 @@ backoff and re-subscription.
 ## Properties
 
 ### Connection
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `broker` | `String` | `wss://broker.hivemq.com:8884/mqtt` | WebSocket broker URL. |
-| `clean_session` | `bool` | `true` | Always true in this release (persistent sessions conflict with auto-resubscribe). |
-| `keep_alive` | `int` | `30` | Seconds between PINGREQs. 0 disables. Half-open detection fires at 1.5× this. |
-| `client_id` | `String` | `""` | Leave empty to auto-generate a CSPRNG ID (20 chars `[0-9a-zA-Z]`) per connect. If set, reused across reconnects. |
-| `username` | `String` | `""` | MQTT username (optional). |
-| `password` | `String` | `""` | MQTT password (optional). |
-| `auto_connect` | `bool` | `true` | Connect on `_ready`. |
+
+| Property        | Type     | Default                             | Description                                                                                                      |
+| --------------- | -------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `broker`        | `String` | `wss://broker.hivemq.com:8884/mqtt` | WebSocket broker URL.                                                                                            |
+| `clean_session` | `bool`   | `true`                              | Always true in this release (persistent sessions conflict with auto-resubscribe).                                |
+| `keep_alive`    | `int`    | `30`                                | Seconds between PINGREQs. 0 disables. Half-open detection fires at 1.5× this.                                    |
+| `client_id`     | `String` | `""`                                | Leave empty to auto-generate a CSPRNG ID (20 chars `[0-9a-zA-Z]`) per connect. If set, reused across reconnects. |
+| `username`      | `String` | `""`                                | MQTT username (optional).                                                                                        |
+| `password`      | `String` | `""`                                | MQTT password (optional).                                                                                        |
+| `auto_connect`  | `bool`   | `true`                              | Connect on `_ready`.                                                                                             |
 
 ### Last Will & Testament
-Applied at CONNECT time only; changing them while connected has no effect
-until the next (re)connect. `will_payload` is read live when the CONNECT
-packet is built, so you can pre-sign a fresh will between reconnects.
 
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `will_topic` | `String` | `""` | Empty = no will. |
-| `will_retain` | `bool` | `false` | RETAIN flag for the will message. |
-| `will_qos` | `int` | `0` | Will QoS (0–2). |
-| `will_payload` | `PackedByteArray` | `empty` | Raw binary will message (not a String). Set from code. |
-| `last_will` | `MqttLastWill` | `null` | **Deprecated** legacy resource; the flat `will_*` properties take precedence when set. |
+Applied at CONNECT time only; changing them while connected has no effect until
+the next (re)connect. `will_payload` is read live when the CONNECT packet is
+built, so you can pre-sign a fresh will between reconnects.
+
+| Property       | Type              | Default | Description                                                                            |
+| -------------- | ----------------- | ------- | -------------------------------------------------------------------------------------- |
+| `will_topic`   | `String`          | `""`    | Empty = no will.                                                                       |
+| `will_retain`  | `bool`            | `false` | RETAIN flag for the will message.                                                      |
+| `will_qos`     | `int`             | `0`     | Will QoS (0–2).                                                                        |
+| `will_payload` | `PackedByteArray` | `empty` | Raw binary will message (not a String). Set from code.                                 |
+| `last_will`    | `MqttLastWill`    | `null`  | **Deprecated** legacy resource; the flat `will_*` properties take precedence when set. |
 
 ### Auto-Reconnect
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `auto_reconnect` | `bool` | `true` | Reconnect after drops with exponential backoff + full jitter. |
-| `reconnect_min_delay` | `float` | `1.0` | Base backoff. |
-| `reconnect_max_delay` | `float` | `30.0` | Backoff cap. The attempt counter resets after a connection that survived ≥ 30 s. |
+
+| Property              | Type    | Default | Description                                                                      |
+| --------------------- | ------- | ------- | -------------------------------------------------------------------------------- |
+| `auto_reconnect`      | `bool`  | `true`  | Reconnect after drops with exponential backoff + full jitter.                    |
+| `reconnect_min_delay` | `float` | `1.0`   | Base backoff.                                                                    |
+| `reconnect_max_delay` | `float` | `30.0`  | Backoff cap. The attempt counter resets after a connection that survived ≥ 30 s. |
 
 ### Robustness / Queue
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `max_packet_size` | `int` | `262144` | Packets whose Remaining Length exceeds this are a protocol error → disconnect. |
-| `offline_queue_size` | `int` | `0` | Bounded outgoing queue while disconnected. 0 = fail-fast (default). Flushes after reconnect, dropping the oldest on overflow. |
-| `outbound_buffer_size` | `int` | `1048576` | WebSocket send buffer. A single packet larger than this is refused (`ERR_INVALID_DATA`). |
-| `outbound_queue_bytes` | `int` | `1048576` | While connected, packets the socket cannot take yet wait in a bounded queue (max 4096 packets). When full, `publish` returns `false` with `ERR_BUSY`. |
-| `transient_queue_bytes` | `int` | `65536` | QoS 0 publishes only wait in that queue while it holds less than this: a short backlog (in the browser everything sent within one frame) is fine, a congested link drops transient updates instead of delivering them late. |
+
+| Property                | Type  | Default   | Description                                                                                                                                                                                                                 |
+| ----------------------- | ----- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_packet_size`       | `int` | `262144`  | Packets whose Remaining Length exceeds this are a protocol error → disconnect.                                                                                                                                              |
+| `offline_queue_size`    | `int` | `0`       | Bounded outgoing queue while disconnected. 0 = fail-fast (default). Flushes after reconnect, dropping the oldest on overflow.                                                                                               |
+| `outbound_buffer_size`  | `int` | `1048576` | WebSocket send buffer. A single packet larger than this is refused (`ERR_INVALID_DATA`).                                                                                                                                    |
+| `outbound_queue_bytes`  | `int` | `1048576` | While connected, packets the socket cannot take yet wait in a bounded queue (max 4096 packets). When full, `publish` returns `false` with `ERR_BUSY`.                                                                       |
+| `transient_queue_bytes` | `int` | `65536`   | QoS 0 publishes only wait in that queue while it holds less than this: a short backlog (in the browser everything sent within one frame) is fine, a congested link drops transient updates instead of delivering them late. |
 
 ## Signals
-| Signal | Description |
-|--------|-------------|
-| `connected(reconnection: bool)` | After CONNACK + re-subscriptions sent. `reconnection` is `false` on first connect, `true` on every reconnect. |
-| `disconnected(reason: String)` | Transport was open but is now closed. |
-| `reconnecting(attempt: int, delay: float)` | Before each reconnect attempt, after the backoff delay is scheduled. |
-| `connecting()` | Socket opening for the first time. |
-| `connecting_failed()` | Initial (non-reconnect) connection attempt failed. |
-| `reconnect_disabled(reason: String)` | Emitted when auto-reconnect is permanently disabled (e.g. after a non-retryable CONNACK), so consumers know not to wait for a reconnect. |
-| `subscribed(topic: String, qos: int)` | On SUBACK, per filter. |
-| `unsubscribed(topic: String)` | On UNSUBACK, per filter. |
-| `message(topic: String, payload: PackedByteArray, retained: bool)` | Incoming PUBLISH. `retained` mirrors the RETAIN bit of the received packet. |
-| `ping(ms: int)` | Round-trip time from PINGREQ to PINGRESP. |
-| `error(message: String)` | Non-fatal and fatal errors (bad packets, CONNACK codes, publish failures). |
+
+| Signal                                                             | Description                                                                                                                              |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `connected(reconnection: bool)`                                    | After CONNACK + re-subscriptions sent. `reconnection` is `false` on first connect, `true` on every reconnect.                            |
+| `disconnected(reason: String)`                                     | Transport was open but is now closed.                                                                                                    |
+| `reconnecting(attempt: int, delay: float)`                         | Before each reconnect attempt, after the backoff delay is scheduled.                                                                     |
+| `connecting()`                                                     | Socket opening for the first time.                                                                                                       |
+| `connecting_failed()`                                              | Initial (non-reconnect) connection attempt failed.                                                                                       |
+| `reconnect_disabled(reason: String)`                               | Emitted when auto-reconnect is permanently disabled (e.g. after a non-retryable CONNACK), so consumers know not to wait for a reconnect. |
+| `subscribed(topic: String, qos: int)`                              | On SUBACK, per filter.                                                                                                                   |
+| `unsubscribed(topic: String)`                                      | On UNSUBACK, per filter.                                                                                                                 |
+| `message(topic: String, payload: PackedByteArray, retained: bool)` | Incoming PUBLISH. `retained` mirrors the RETAIN bit of the received packet.                                                              |
+| `ping(ms: int)`                                                    | Round-trip time from PINGREQ to PINGRESP.                                                                                                |
+| `error(message: String)`                                           | Non-fatal and fatal errors (bad packets, CONNACK codes, publish failures).                                                               |
 
 ## Methods
+
 ```gdscript
 func connect_to_broker() -> Error
 func disconnect_from_broker(flush_timeout_ms: int = 0) -> Error  # > 0: block until the close handshake completed (before freeing / quitting; no effect on Web)
@@ -86,30 +94,34 @@ func send_ping() -> Error  # normally automatic via keep_alive
 func take_unacknowledged() -> Array  # QoS>0 publishes a dead connection never got acknowledged
 var last_publish_error: Error  # why the last publish() returned false
 ```
+
 - `publish` accepts `PackedByteArray` (raw bytes) or `String` (UTF-8). Returns
   `false` when not connected unless `offline_queue_size > 0`;
-  `last_publish_error` then says why: `ERR_BUSY` (congested, or no free
-  packet id - retry later), `ERR_CONNECTION_ERROR` (not connected),
-  `ERR_INVALID_DATA` (too large for the socket), `ERR_INVALID_PARAMETER`.
-  QoS 1/2 are supported on the **receive** side (PUBACK/PUBREC/PUBREL/PUBCOMP
-  handshake handled); on the **send** side QoS 1 publishes are tracked for
-  PUBACK but **not** retransmitted on timeout. With Clean Session nothing is
-  resent after a reconnect either: `take_unacknowledged()` hands back the
-  publishes (`{topic, payload, qos, retain}`, oldest first) the dead
-  connection never got acknowledged, so the caller can publish them again.
-  An unsupported QoS value fails loudly and returns `false`.
+  `last_publish_error` then says why: `ERR_BUSY` (congested, or no free packet
+  id - retry later), `ERR_CONNECTION_ERROR` (not connected), `ERR_INVALID_DATA`
+  (too large for the socket), `ERR_INVALID_PARAMETER`. QoS 1/2 are supported on
+  the **receive** side (PUBACK/PUBREC/PUBREL/PUBCOMP handshake handled); on the
+  **send** side QoS 1 publishes are tracked for PUBACK but **not** retransmitted
+  on timeout. With Clean Session nothing is resent after a reconnect either:
+  `take_unacknowledged()` hands back the publishes
+  (`{topic, payload, qos, retain}`, oldest first) the dead connection never got
+  acknowledged, so the caller can publish them again. An unsupported QoS value
+  fails loudly and returns `false`.
 - `subscribe`/`unsubscribe` update a registry that is replayed after every
   reconnect, so subscriptions survive drops without user code.
 
 ### Static Helpers
+
 ```gdscript
 static func topic_matches(filter: String, topic: String) -> bool
 ```
+
 MQTT 3.1.1 filter matching: `+` = one level, `#` = rest (last level only,
-including zero levels), literal levels compare byte-exact, and wildcard
-filters do not match `$`-prefixed topics.
+including zero levels), literal levels compare byte-exact, and wildcard filters
+do not match `$`-prefixed topics.
 
 ## Example: Connect with a Binary Retained Will, Subscribe, Publish
+
 ```gdscript
 extends Node2D
 
@@ -148,6 +160,7 @@ func _on_message(topic: String, payload: PackedByteArray, retained: bool) -> voi
 ```
 
 ## Security Note on Client IDs
+
 When `client_id` is left empty, the node generates a fresh 20-char ID from
 `Crypto.generate_random_bytes` on **every** connect. MQTT 3.1.1 brokers
 disconnect the existing session when a duplicate client ID connects, so a
@@ -155,23 +168,28 @@ predictable or reused ID is a remote-disconnect vector. Set `client_id`
 explicitly only if you have a reason to, and prefer a high-entropy value.
 
 ## Headless Tests
+
 Pure packet codec and matcher tests (no broker) live in `tests/test_mqtt.gd`:
+
 ```
 godot --headless -s tests/test_mqtt.gd
 ```
+
 They cover CONNECT encoding (with/without will), PUBLISH encode/decode with
 retain/qos bits, Remaining Length edge values (127/128/16383/16384),
 `topic_matches` table, byte-by-byte stream reassembly, and parser fuzzing.
 
 ## Breaking Changes from 0.1.x → 0.2.0
+
 - **`message` signal** now emits `(topic, payload, retained)` — the previous
   `(topic, msg)` signature is gone. Update handlers to accept `retained`.
 - **`connected` signal** now emits `(reconnection: bool)`.
 - **`disconnected` signal** now emits `(reason: String)`.
-- **`publish` signature** changed to `publish(topic, payload, retain=false, qos=0)`
-  and returns `bool` instead of `Error`. `payload` accepts `String` or
-  `PackedByteArray`.
-- **New signals**: `reconnecting`, `subscribed`, `unsubscribed` (renamed/aligned).
+- **`publish` signature** changed to
+  `publish(topic, payload, retain=false, qos=0)` and returns `bool` instead of
+  `Error`. `payload` accepts `String` or `PackedByteArray`.
+- **New signals**: `reconnecting`, `subscribed`, `unsubscribed`
+  (renamed/aligned).
 - **Last will**: prefer the flat `will_topic`/`will_payload`/`will_qos`/
   `will_retain` properties over the `MqttLastWill` resource (still read for
   backward compatibility).
